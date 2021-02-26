@@ -1,0 +1,411 @@
+#!/usr/local/bin/python3
+import time
+import timeout_decorator
+
+import chips
+import random
+import utils
+import os
+import time
+qx2 = chips.ibmqx2()
+q20 = chips.ibmq16()
+
+#class DAG_node:
+#	def __init__(self):
+#		self.gate_id = -1
+#		self.left_parent = -1
+#		self.right_parent = -1
+#		self.left_child = -1
+#		self.right_parent = -1
+
+def print_schedule(gate_type, gate_qubit):
+	f = open("sabre.dump", "a")
+	if gate_type == 1:
+		f.write("u q[%d];\n" % (gate_qubit))
+	elif gate_type == 2:
+		f.write("cx q[%d],q[%d];\n" % (gate_qubit[0], gate_qubit[1]))
+	f.close()
+
+def floyd(node_num, adj_mat):
+	distance_mat = [0] * node_num
+	for i in range(node_num):
+		distance_mat[i] = [0] * node_num
+	
+	for i in range(node_num):
+		for j in range(node_num):
+			if adj_mat[i][j] != 0:
+				distance_mat[i][j] = adj_mat[i][j]
+			else:
+				distance_mat[i][j] = 1000000000
+		distance_mat[i][i] = 0
+
+	#print(distance_mat)
+
+	for k in range(node_num):
+		for i in range(node_num):
+			for j in range(node_num):
+				if distance_mat[i][j] > distance_mat[i][k] + distance_mat[k][j]:
+					distance_mat[i][j] = distance_mat[i][k] + distance_mat[k][j]
+	
+	return distance_mat
+
+def DAG_generator(qubit_num, circuit, gate_state, qubit_state, gate_dependency):
+	gate_num = len(circuit)
+
+	first_layer_gates_idx = []
+	current_gate_idx = [-1] * qubit_num
+	
+	following_gate_idx = [0] * gate_num
+	for i in range(gate_num):
+		following_gate_idx[i] = [0] * 2
+
+	for i in range(gate_num):
+		gate = circuit[i]
+		if current_gate_idx[gate[0]] == -1:
+			if current_gate_idx[gate[1]] == -1:
+				first_layer_gates_idx.append(i)
+				gate_state[i] = 2
+				qubit_state[gate[0]] = 1
+				qubit_state[gate[1]] = 1
+				gate_dependency[i] = 0
+			else:
+				gate_dependency[i] = 1
+		if current_gate_idx[gate[1]] == -1 and current_gate_idx[gate[0]] != -1:
+			gate_dependency[i] = 1
+
+		for j in range(len(gate)):
+			qubit = gate[j]
+			if current_gate_idx[qubit] != -1:
+				prior_gate = circuit[current_gate_idx[qubit]]
+				if prior_gate[j] != qubit:
+					qubit_idx = 1 - j
+				else:
+					qubit_idx = j
+				following_gate_idx[current_gate_idx[qubit]][qubit_idx] = i
+			current_gate_idx[qubit] = i
+		#print(gate)
+		#print(current_gate_idx)
+		#print(following_gate_idx)
+	#for gates in following_gate_idx:
+	#	gates = gates.sort()
+	#print(following_gate_idx)
+	return following_gate_idx, first_layer_gates_idx, gate_state, qubit_state
+
+#gate_state
+# 0 - not considered
+# 1 - in future gate queue
+# 2 - in current gate layer
+# 3 - executed
+
+#qubit_state
+# 0 - not occupied in current layer	  
+# 1 - occupied in current layer
+def maintain_layer(current_layer_gates_idx, gate_execute_idx_list, circuit, gate_state, following_gate_idx, qubit_state, gate_dependency):
+	updated_layer_gates_idx = []
+	future_layer_gates_idx = []
+	
+	#print('execute list: ', gate_execute_idx_list)
+	#print('current layer: ', current_layer_gates_idx)
+	for gate_idx in current_layer_gates_idx:
+		updated_layer_gates_idx.append(gate_idx)
+		for gate_execute_idx in gate_execute_idx_list:
+			if gate_execute_idx == gate_idx:
+				print('execute: ', gate_idx)
+				gate = circuit[gate_idx]
+				gate_state[gate_idx] = 3
+				qubit_state[gate[0]] = 0
+				qubit_state[gate[1]] = 0
+				print('gate: ', gate)
+				updated_layer_gates_idx.remove(gate_idx)
+				following_gates = following_gate_idx[gate_idx]
+				for next_gate_idx in following_gates:
+					gate_dependency[next_gate_idx] -= 1
+	#				print('next gate: ', next_gate_idx)
+	#				print(qubit_state)
+					if gate_dependency[next_gate_idx] == 0:
+						updated_layer_gates_idx.append(next_gate_idx)
+						gate_state[next_gate_idx] = 2
+						qubit_state[circuit[next_gate_idx][0]] = 1
+						qubit_state[circuit[next_gate_idx][1]] = 1
+	
+	# set future layer size
+	if len(updated_layer_gates_idx) > 0:
+		start_gate = min(updated_layer_gates_idx)
+#	print(start_gate)
+		for gate_idx in range(start_gate, start_gate + 20):
+#			print(gate_idx)
+			if gate_idx < len(circuit):
+				if gate_state[gate_idx] == 0:
+					gate_state[gate_idx] = 1
+#	print(gate_state)
+	for gate_idx in range(len(circuit)):
+		if gate_state[gate_idx] == 1:
+			future_layer_gates_idx.append(gate_idx)
+	updated_layer_gates_idx = sorted(updated_layer_gates_idx)
+	future_layer_gates_idx = sorted(future_layer_gates_idx)
+#	quit()
+	return updated_layer_gates_idx, future_layer_gates_idx
+
+def heuristic(new_mapping, current_layer_gates_idx, future_gates_idx, distance_mat, circuit):
+	cost = 0.0
+	first_cost = 0.0
+
+	if len(current_layer_gates_idx) == 0:
+		return 0
+	for gate_idx in current_layer_gates_idx:
+		gate = circuit[gate_idx]
+		first_cost = first_cost + distance_mat[new_mapping[gate[0]]][new_mapping[gate[1]]]
+	first_cost = first_cost / len(current_layer_gates_idx)
+
+	if len(future_gates_idx) == 0:
+		cost = first_cost
+		return cost
+	second_cost = 0.0
+	for gate_idx in future_gates_idx:
+		gate = circuit[gate_idx]
+		second_cost = second_cost = distance_mat[new_mapping[gate[0]]][new_mapping[gate[1]]]
+	second_cost = second_cost / len(future_gates_idx)
+
+	cost = first_cost +  0.5 * second_cost
+
+	return cost
+
+test_circuit = [[1, 0],
+[2, 0],
+[3, 4],
+[3, 4],
+[1, 0],
+[3, 0],
+[3, 4],
+[4, 0],
+[3, 2],
+[1, 0],
+[2, 0],
+[0, 4],
+[4, 0],
+[3, 1],
+[3, 0],
+[4, 1],
+[3, 4],
+[4, 1],
+[2, 1],
+[1, 3]
+]
+
+def find_executable_gates(mapping, current_layer, circuit, distance_mat):
+	executable_gates = []
+	for gate_idx in current_layer:
+		if distance_mat[mapping[circuit[gate_idx][0]]][mapping[circuit[gate_idx][1]]] == 1:
+			executable_gates.append(gate_idx)
+	return executable_gates
+
+def find_reverse_mapping(mapping, qubit_num):
+	reverse_mapping = [-1] * qubit_num
+	for l_qubit in range(len(mapping)):
+		p_qubit = mapping[l_qubit]
+		reverse_mapping[p_qubit] = l_qubit
+	return reverse_mapping
+
+def pick_one_movement(mapping, current_layer, future_layer, distance_mat, qubit_num, circuit, chip, one_time):
+	l2p_mapping = mapping
+	key_p_qubits = []
+	for gate_idx in current_layer:
+		gate = circuit[gate_idx]
+		key_p_qubits.append(l2p_mapping[gate[0]])
+		key_p_qubits.append(l2p_mapping[gate[1]])
+
+	possible_pairs = []
+	for p_qubit in key_p_qubits:
+		for p_qubit_target in chip.edge_list[p_qubit]:
+			possible_pairs.append([p_qubit, p_qubit_target])
+
+	score = [0.0] * len(possible_pairs)
+	for pair_idx in range(len(possible_pairs)):
+		pair = possible_pairs[pair_idx]
+		p2l_mapping = find_reverse_mapping(l2p_mapping, qubit_num)
+		p2l_mapping[pair[0]], p2l_mapping[pair[1]] = p2l_mapping[pair[1]], p2l_mapping[pair[0]]
+		temp_l2p_mapping = find_reverse_mapping(p2l_mapping, qubit_num)
+		score[pair_idx] = heuristic(temp_l2p_mapping, current_layer, future_layer, distance_mat, circuit)
+
+	best_move_idx = score.index(min(score))
+	pair = possible_pairs[best_move_idx]
+	p2l_mapping = find_reverse_mapping(l2p_mapping, qubit_num)
+	p2l_mapping[pair[0]], p2l_mapping[pair[1]] = p2l_mapping[pair[1]], p2l_mapping[pair[0]]
+	new_mapping = find_reverse_mapping(p2l_mapping, qubit_num)
+
+	return new_mapping, gate
+
+def one_round_optimization(initial_mapping, distance_mat, circuit, qubit_num, chip, gate_pc, one_time, execute_finish, gate_type, gate_qubit, gate_dependencies):
+	swap_num = 0
+	mapping = initial_mapping
+
+	executed_gates_num = 0
+	gate_num = len(circuit)
+	gate_state = [0] * gate_num
+	gate_dependency = [2] * gate_num
+	qubit_state = [0] * qubit_num
+	following_gates_idx, first_layer_gates_idx, gate_state, qubit_state = DAG_generator(qubit_num, circuit, gate_state, qubit_state, gate_dependency)
+
+	current_layer = first_layer_gates_idx
+	current_layer, future_layer = maintain_layer(current_layer, [] , circuit, gate_state, following_gates_idx, qubit_state, gate_dependency)
+	#print(current_layer)
+	#print(future_layer)
+	#quit()
+	#print(mapping)
+
+	if one_time == 1:
+		#print(gate_num)
+		f = open("sabre.dump", "a")
+		flag = 0
+
+	while executed_gates_num < gate_num:
+
+		execute_gates_idx = find_executable_gates(mapping, current_layer, circuit, distance_mat)
+		#print(execute_gates_idx)
+		#print('execute: ')
+		#print(execute_gates_idx)
+		#quit()
+		if len(execute_gates_idx) > 0:
+			print('execute: ')
+			print(execute_gates_idx)
+			#print(gate_type[execute_gates_idx[0]])
+			# if we are dumping schedule, and if this is first 2 qubit execution, make sure all siingle qubit executions are finished before
+			if one_time == 1:
+				if flag == 0:
+					for i in range(0, gate_pc[min(execute_gates_idx)]):
+						if execute_finish[i] == 0:
+							print_schedule(gate_type[i], gate_qubit[i])
+
+				flag = 1
+
+			current_layer, future_layer = maintain_layer(current_layer, execute_gates_idx, circuit, gate_state, following_gates_idx, qubit_state, gate_dependency)
+
+			if one_time == 1:
+				# now print the CNOTs that can be executed
+				for i in range(len(execute_gates_idx)):
+					global_index = gate_pc[execute_gates_idx[i]]
+					print_schedule(gate_type[global_index], gate_qubit[global_index])
+					# now add the dependent instructions too
+					for j in range(i, len(gate_pc)):
+						if global_index == gate_dependencies[j]:
+							print_schedule(gate_type[j], gate_qubit[j])
+
+			executed_gates_num += len(execute_gates_idx)
+#			print(current_layer)
+#			print(future_layer)
+#			print(gate_state)
+#			quit()
+		else:
+			#if one_time == 1:
+				#print('before swap')
+				#print(current_layer)
+				#print(future_layer)
+				#print(gate_state)
+				#print(executed_gates_num)
+				#print('swap ', gate_pc[executed_gates_num])
+				#quit()
+				#print(mapping)
+			old_mapping = mapping
+			print('Current layer', current_layer)
+			for i in range(len(current_layer)):
+				print('Gate iD', current_layer[i], 'Qubits', gate_qubit[gate_pc[current_layer[i]]])
+			mapping, cnot_gate = pick_one_movement(mapping, current_layer, future_layer, distance_mat, qubit_num, circuit, chip, one_time)
+			if one_time == 1:
+				diff = [] # logical qubits being swapped
+				for i in range(len(old_mapping)):
+					if old_mapping[i] != mapping[i]:
+						diff.append(i)
+
+				#print('after swap: ', diff)
+				#print(old_mapping, mapping)
+				f.write("(%d, %d)\n" % (diff[0], diff[1]))
+				print('SWAP Logical', cnot_gate)
+				print(diff[0], diff[1])
+
+
+
+			swap_num += 1
+	final_mapping = mapping
+
+
+	if one_time == 1:
+		#print(gate_num)
+		f.close()
+
+	return swap_num, final_mapping
+
+@timeout_decorator.timeout(1, timeout_exception=StopIteration)
+def run_sabre(filename, one_time, initial_mapping):
+	#initial mapping
+	#first round
+	#reverse search
+	distance_mat = floyd(q20.qubit_num, q20.adj_mat)
+	label = [x for x in range(q20.qubit_num)]
+	#initial_mapping = random.sample(label,5)
+
+	#for filename in os.listdir('./test/examples'):
+	#	if filename.endswith('.qasm'):
+			#print(filename)
+
+	#filename = 'bv9.qasm'
+
+	qubit_num, gate_type, gate_qubit, cx_gate_num, cx_gates, gate_pc, gate_dependencies = utils.read_flatten_qasm('./test/examples/' + filename)
+	execute_finish = [0] * len(gate_dependencies)
+
+	#print('qubit num ', qubit_num)
+	#print('gate list ', gate_qubit)
+	#print('gate type ', gate_type)
+	#print('cx gates ', cx_gates)
+	#print('execute finish ', execute_finish)
+	#print('gate_pc ', gate_pc)
+
+	#one_time = 0
+	if one_time == 0:
+		initial_mapping = random.sample(label,qubit_num)
+
+	test_circuit = cx_gates
+	#print(initial_mapping[0:qubit_num])
+
+
+	# reverse needs to be added for single pass
+	if one_time == 1:
+		test_circuit.reverse()
+	start = time.time()
+	swap_num, final_mapping = one_round_optimization(initial_mapping, distance_mat, test_circuit, q20.qubit_num, q20, gate_pc, one_time, execute_finish, gate_type, gate_qubit, gate_dependencies)
+
+	#print('time: ', time.time() - start)
+	#print('total swaps: ', swap_num)
+	if one_time == 1:
+		return initial_mapping[0:qubit_num], swap_num
+	#test_circuit.reverse()
+
+	#print(final_mapping[0:qubit_num])
+	start = time.time()
+	swap_num, final_mapping = one_round_optimization(final_mapping, distance_mat, test_circuit, q20.qubit_num, q20, [], [], [], [], [], [])
+	#print('time: ', time.time() - start)
+	#print('total swaps: ', swap_num)
+	test_circuit.reverse()
+
+	#print(final_mapping[0:qubit_num])
+	start = time.time()
+	swap_num, final_mapping = one_round_optimization(final_mapping, distance_mat, test_circuit, q20.qubit_num, q20, [], [], [], [], [], [])
+	#print('time: ', time.time() - start)
+	#print('total swaps: ', swap_num)
+	test_circuit.reverse()
+
+	#print(final_mapping[0:qubit_num])
+	start = time.time()
+	initial_mapping = final_mapping
+	swap_num, final_mapping = one_round_optimization(final_mapping, distance_mat, test_circuit, q20.qubit_num, q20, [], [], [], [], [], [])
+	#print('time: ', time.time() - start)
+	#print('total swaps: ', swap_num)
+	#print(initial_mapping)
+			#quit()
+	#print(distance_mat)
+
+	return initial_mapping[0:qubit_num], swap_num
+
+if __name__ == '__main__':
+	filename = 'ising_model_10.qasm'
+	one_time = 0
+	run_sabre(filename, one_time, [])
